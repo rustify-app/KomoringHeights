@@ -614,9 +614,8 @@ void KomoringHeights::UpdateFinalPv(Node& n, Move move, const SearchResult& resu
   if (result.Pn() == 0 && result.Len() == kMinus1MateLen) {
     return;
   }
-  // 合駒割引モードでは手数が実際の手順と一致しないので PV を作らず、手ごとの結果だけ記録する
+  // 合駒割引モードでは手数が実際の手順と一致しないので PV を作らない
   if (g_discount_defender_drops) {
-    pv_list_.Update(move, result, 1, std::vector<Move>{move});
     return;
   }
   if (result.Pn() == 0) {

@@ -1780,7 +1780,6 @@ struct DfpnOutcome {
   int len{-1};  // 証明された手数（下界モードでは合駒を2手割り引いた手数）
   std::vector<Move> moves;
   bool min_proven{false};
-  std::vector<std::pair<Move, komori::NodeState>> root;  // root_moves 指定時の根の各手の結果
 };
 
 /// 手順が合法な詰み手順か。final_check が false なら最終局面の応手の有無は調べない。
@@ -1814,20 +1813,12 @@ bool IsValidMatePath(Position& p, const std::vector<Move>& moves, bool or_root, 
 }
 
 /// df-pn を1回実行する。max_len > 0 ならその手数以内の詰みだけを探す。
-DfpnOutcome RunDfpn(const std::string& sfen, std::uint64_t time_ms, int max_len = 0, bool no_drops = false,
-                    bool root_moves = false) {
+DfpnOutcome RunDfpn(const std::string& sfen, std::uint64_t time_ms, int max_len = 0, bool no_drops = false) {
   // no_drops: 下界モード。玉方の打ちを2手少なく数える（無駄合を除いた手数の下界）
-  // root_moves: 根の全ての手の詰み／不詰を1回の探索でまとめて調べる（MultiPV）
   komori::g_discount_defender_drops = no_drops;
   const bool saved_futile = komori::g_futile_interposition;
   if (no_drops) komori::g_futile_interposition = false;  // 割引モードでは無駄合判定は不要
   g_option.max_mate_len = max_len;
-  const auto saved_multi_pv = g_option.multi_pv;
-  const auto saved_post_search = g_option.post_search_level;
-  if (root_moves) {
-    g_option.multi_pv = 1000;
-    g_option.post_search_level = komori::PostSearchLevel::kNone;
-  }
   // 合駒あり／なしで結果の意味が違うので置換表を分ける。同じモード同士では置換表を使い回す
   // （証明は手順を並べ直して確認するので、別局面の証明が紛れても誤りにはならない）。
   g_active_searcher = &g_searchers[no_drops ? 1 : 0];
@@ -1842,13 +1833,6 @@ DfpnOutcome RunDfpn(const std::string& sfen, std::uint64_t time_ms, int max_len 
   Threads.main()->wait_for_search_finished();
   DfpnOutcome out;
   out.state = g_search_result;
-  if (root_moves) {
-    for (const auto& [move, result] : Searcher().RootResults()) {
-      out.root.emplace_back(move, result.IsFinal() ? result.GetNodeState() : komori::NodeState::kUnknown);
-    }
-    g_option.multi_pv = saved_multi_pv;
-    g_option.post_search_level = saved_post_search;
-  }
   if (out.state == komori::NodeState::kProven && no_drops) {
     // 下界モードでは PV を作らないので手数だけを使う
     out.len = static_cast<int>(Searcher().ProvenLen().Len());
@@ -1874,44 +1858,6 @@ DfpnOutcome RunDfpn(const std::string& sfen, std::uint64_t time_ms, int max_len 
   return out;
 }
 
-bool IsDropInterposition(const Position& pos, Move m) {
-  if (!is_drop(m)) return false;
-  const Square ksq = pos.king_square(pos.side_to_move());
-  Bitboard checkers = pos.checkers();
-  while (checkers) {
-    if (between_bb(ksq, checkers.pop()).test(to_sq(m))) return true;
-  }
-  return false;
-}
-
-/// SFEN の持ち駒から、指定した手番の駒を1枚取り除く
-std::string RemoveOneFromHand(const std::string& sfen, Color c, PieceType pt) {
-  std::istringstream in(sfen);
-  std::string board, turn, hand, ply;
-  in >> board >> turn >> hand >> ply;
-  const std::string order = "RBGSNLPrbgsnlp";
-  std::array<int, 14> counts{};
-  if (hand != "-") {
-    int n = 0;
-    for (char ch : hand) {
-      if (std::isdigit(static_cast<unsigned char>(ch))) { n = n * 10 + (ch - '0'); continue; }
-      const auto at = order.find(ch);
-      if (at != std::string::npos) counts[at] += n == 0 ? 1 : n;
-      n = 0;
-    }
-  }
-  const char upper = "?PLNSBRG"[pt];
-  const auto idx = order.find(c == BLACK ? upper : static_cast<char>(std::tolower(upper)));
-  if (idx != std::string::npos && counts[idx] > 0) --counts[idx];
-  std::string out;
-  for (std::size_t i = 0; i < order.size(); ++i) {
-    if (counts[i] == 0) continue;
-    if (counts[i] > 1) out += std::to_string(counts[i]);
-    out += order[i];
-  }
-  return board + " " + turn + " " + (out.empty() ? "-" : out) + " " + ply;
-}
-
 bool HasSurplusAfter(Position& root, const std::vector<Move>& line) {
   std::vector<StateInfo> st(line.size());
   for (std::size_t i = 0; i < line.size(); ++i) root.do_move(line[i], st[i]);
@@ -1920,227 +1866,8 @@ bool HasSurplusAfter(Position& root, const std::vector<Move>& line) {
   return surplus;
 }
 
-bool g_rule_trace = false;
 /// false なら tsume_answer で余詰検証（作意途中の別の王手の探索）を省き、解答だけを求める
 bool g_answer_check_alternatives = true;
-
-struct RuleResult {
-  int len{-1};            // 上限以内のルール上の詰み手数。-1 なら上限以内に詰まない（不詰を含む）
-  bool unknown{false};    // 時間内に判定できなかった
-  std::vector<Move> line;
-};
-
-/// 無駄合を除いた詰将棋ルールでの手数を、上限付きで求める。
-///   - 合駒ありの df-pn 手数はルール上の手数の上界（無駄合も応手として数えるため）
-///   - 合駒割引（玉方の打ちを2手少なく数える）の df-pn 手数は下界
-/// を使って、攻方ノードでは最短、玉方ノードでは最長を枝刈りしながら求める。
-class RuleSolver {
- public:
-  explicit RuleSolver(std::uint64_t node_ms) : node_ms_{node_ms} {}
-
-  /// 攻方手番: bound 手以内の最短の詰み
-  RuleResult SolveOr(Position& pos, int bound, int depth = 0) {
-    if (bound < 1) return {};
-    if (depth > 300 || calls_ > kMaxCalls) return Unknown();
-    const std::string key = pos.sfen();
-    if (auto hit = Lookup(or_memo_, key, bound)) return *hit;
-    const int requested = bound;
-
-    const auto& ub = Dfpn(pos.sfen(), bound, false);
-    if (ub.state == komori::NodeState::kProven) {
-      bound = static_cast<int>(ub.moves.size());
-      if (bound == 1) return Store(or_memo_, key, requested, RuleResult{1, false, ub.moves});
-    }
-    // 候補: 合駒割引の df-pn でも bound 手以内に詰まないと示せなかった王手。
-    // 根の全ての手を1回の探索（MultiPV）でまとめて調べる。
-    std::vector<std::pair<int, Move>> candidates;  // (並べ替え用の優先度, 王手)
-    bool unknown = false;
-    if (bound == 1) {
-      // 子で0手（応手なし、または全て無駄合）かどうかは SolveAnd で直接調べる。
-      // max_len=0 は「上限なし」を意味するので df-pn には渡さない。
-      for (const auto& ext : MoveList<LEGAL_ALL>(pos))
-        if (pos.gives_check(ext.move)) candidates.emplace_back(0, ext.move);
-    } else {
-      const auto& lb = DfpnRoot(pos.sfen(), bound);
-      for (const auto& [m, state] : lb.root) {
-        if (state == komori::NodeState::kDisproven || state == komori::NodeState::kRepetition) continue;
-        candidates.emplace_back(state == komori::NodeState::kProven ? 0 : 1, m);
-      }
-      // 作意の手（上界の最善手）を先に調べると、以降の候補の上限が狭まる
-      if (ub.state == komori::NodeState::kProven && !ub.moves.empty()) {
-        for (auto& c : candidates) if (c.second == ub.moves.front()) c.first = -1;
-      }
-    }
-    std::stable_sort(candidates.begin(), candidates.end(),
-                     [](const auto& a, const auto& b) { return a.first < b.first; });
-    RuleResult r;
-    for (const auto& [priority, m] : candidates) {
-      const int limit = r.len >= 0 ? r.len - 2 : bound - 1;  // 子で必要な手数上限
-      if (limit < 0) break;
-      StateInfo st;
-      pos.do_move(m, st);
-      const auto child = SolveAnd(pos, limit, depth + 1);
-      pos.undo_move(m);
-      if (child.unknown) { unknown = true; continue; }
-      if (child.len < 0) continue;
-      r.len = child.len + 1;
-      r.line = {m};
-      r.line.insert(r.line.end(), child.line.begin(), child.line.end());
-    }
-    if (unknown) r = Unknown();
-    Store(or_memo_, key, requested, r);
-    if (g_rule_trace)
-      sync_cout << "info string [trace] " << std::string(depth, ' ') << "OR bound=" << bound << " len=" << r.len
-                << (r.unknown ? " unknown " : " ") << komori::ToString(r.line) << " | " << pos.sfen() << sync_endl;
-    return r;
-  }
-
-  /// 玉方手番: 無駄合を除いた最長抵抗。bound 手を超えるなら len = -1
-  RuleResult SolveAnd(Position& pos, int bound, int depth = 0) {
-    if (depth > 300 || calls_ > kMaxCalls) return Unknown();
-    const std::string key = pos.sfen();
-    if (auto hit = Lookup(and_memo_, key, bound)) return *hit;
-
-    std::vector<std::pair<int, Move>> candidates;  // (上界, 応手)
-    bool any_reply = false;
-    for (const auto& ext : MoveList<LEGAL_ALL>(pos)) {
-      any_reply = true;
-      const Move m = ext.move;
-      if (IsDropInterposition(pos, m) && IsFutile(pos, m, bound)) continue;
-      // 有効な応手があれば少なくとも2手（応手＋詰めの1手）かかる
-      if (bound < 2) return Store(and_memo_, key, bound, RuleResult{});
-      StateInfo st;
-      pos.do_move(m, st);
-      const std::string child = pos.sfen();
-      const auto& ub = Dfpn(child, bound - 1, false);
-      int upper = bound - 1;
-      if (ub.state == komori::NodeState::kProven) {
-        upper = static_cast<int>(ub.moves.size());
-      } else {
-        // 合駒割引でも上限以内に詰まなければ、この応手で上限を超える。
-        // 判定できなければ再帰探索（SolveOr）に任せる。
-        const auto& lb = Dfpn(child, bound - 1, true);
-        if (lb.state == komori::NodeState::kDisproven || lb.state == komori::NodeState::kRepetition) {
-          pos.undo_move(m);
-          return Store(and_memo_, key, bound, RuleResult{});
-        }
-      }
-      pos.undo_move(m);
-      candidates.emplace_back(upper, m);
-    }
-    if (!any_reply || candidates.empty()) return Store(and_memo_, key, bound, RuleResult{0, false, {}});
-
-    std::stable_sort(candidates.begin(), candidates.end(),
-                     [](const auto& a, const auto& b) { return a.first > b.first; });
-    RuleResult r;
-    for (const auto& [upper, m] : candidates) {
-      if (r.len >= 0 && upper + 1 < r.len) break;
-      StateInfo st;
-      pos.do_move(m, st);
-      const auto child = SolveOr(pos, std::min(upper, bound - 1), depth + 1);
-      pos.undo_move(m);
-      if (child.unknown || child.len < 0) {
-        RuleResult bad;
-        bad.unknown = child.unknown;
-        return Store(and_memo_, key, bound, bad);
-      }
-      const int len = child.len + 1;
-      std::vector<Move> cand_line{m};
-      cand_line.insert(cand_line.end(), child.line.begin(), child.line.end());
-      // 同手数なら駒が余らない手順を選ぶ
-      const bool better_tie = len == r.len && HasSurplusAfter(pos, r.line) && !HasSurplusAfter(pos, cand_line);
-      if (len > r.len || better_tie) {
-        r.len = len;
-        r.line = std::move(cand_line);
-      }
-    }
-    if (g_rule_trace) {
-      sync_cout << "info string [trace] " << std::string(depth, ' ') << "AND bound=" << bound << " len=" << r.len << " "
-                << komori::ToString(r.line) << " cands:";
-      for (const auto& [u, m] : candidates) std::cout << ' ' << USI::move(m) << '/' << u;
-      std::cout << sync_endl;
-    }
-    return Store(and_memo_, key, bound, r);
-  }
-
-  /// 打ち合 m が無駄合か: 取った後、取った駒を使わずに詰むなら無駄合
-  bool IsFutile(Position& pos, Move m, int bound) {
-    const Color attacker = ~pos.side_to_move();
-    const PieceType dropped = move_dropped_piece(m);
-    StateInfo st1;
-    pos.do_move(m, st1);
-    bool futile = false;
-    for (const auto& ext : MoveList<LEGAL_ALL>(pos)) {
-      const Move c = ext.move;
-      if (is_drop(c) || to_sq(c) != to_sq(m) || !pos.gives_check(c)) continue;
-      StateInfo st2;
-      pos.do_move(c, st2);
-      const std::string sfen = RemoveOneFromHand(pos.sfen(), attacker, dropped);
-      pos.undo_move(c);
-      if (Dfpn(sfen, std::max(bound, 1), false).state == komori::NodeState::kProven) { futile = true; break; }
-    }
-    pos.undo_move(m);
-    return futile;
-  }
-
-  /// 合駒割引・手数上限付きで、根（攻方手番）の全ての王手の詰み／不詰をまとめて調べる
-  const DfpnOutcome& DfpnRoot(const std::string& sfen, int max_len) {
-    const std::string key = sfen + "|" + std::to_string(max_len) + "|root";
-    if (auto it = dfpn_memo_.find(key); it != dfpn_memo_.end()) return it->second;
-    ++calls_;
-    return dfpn_memo_[key] = RunDfpn(sfen, node_ms_ * 2, max_len, true, true);
-  }
-
-  const DfpnOutcome& Dfpn(const std::string& sfen, int max_len, bool no_drops) {
-    const std::string key = sfen + "|" + std::to_string(max_len) + (no_drops ? "|nd" : "");
-    if (auto it = dfpn_memo_.find(key); it != dfpn_memo_.end()) return it->second;
-    ++calls_;
-    auto out = RunDfpn(sfen, node_ms_, max_len, no_drops);
-    // 時間切れのときだけ、時間を増やして1回だけ再試行する。
-    // 合駒割引（下界）は枝刈り用で、決着しなくても再帰探索で判定できるので再試行しない。
-    if (out.state == komori::NodeState::kUnknown && !no_drops) out = RunDfpn(sfen, node_ms_ * 2, max_len, no_drops);
-    return dfpn_memo_[key] = out;
-  }
-
-  std::uint64_t Calls() const { return calls_; }
-
- private:
-  static RuleResult Unknown() { RuleResult r; r.unknown = true; return r; }
-  static constexpr std::uint64_t kMaxCalls = 50000;
-
-  std::uint64_t node_ms_;
-  std::uint64_t calls_{0};
-  std::unordered_map<std::string, DfpnOutcome> dfpn_memo_;
-  /// 局面ごとのメモ。exact は上限内で求まった真の手数、exceeded は「この手数を超える」ことが分かった上限。
-  struct Memo {
-    bool has_exact{false};
-    RuleResult exact;
-    int exceeded{-1};
-    int unknown_at{-1};
-  };
-
-  static std::optional<RuleResult> Lookup(std::unordered_map<std::string, Memo>& memo, const std::string& key,
-                                          int bound) {
-    const auto it = memo.find(key);
-    if (it == memo.end()) return std::nullopt;
-    const auto& m = it->second;
-    if (m.has_exact) return m.exact.len <= bound ? m.exact : RuleResult{};
-    if (m.exceeded >= bound) return RuleResult{};
-    if (m.unknown_at == bound) return Unknown();
-    return std::nullopt;
-  }
-
-  static RuleResult Store(std::unordered_map<std::string, Memo>& memo, const std::string& key, int bound,
-                          const RuleResult& r) {
-    auto& m = memo[key];
-    if (r.unknown) m.unknown_at = bound;
-    else if (r.len >= 0) { m.has_exact = true; m.exact = r; }
-    else m.exceeded = std::max(m.exceeded, bound);
-    return r;
-  }
-
-  std::unordered_map<std::string, Memo> or_memo_, and_memo_;
-};
 
 const char* NodeStateName(komori::NodeState s) {
   switch (s) {
@@ -2609,34 +2336,6 @@ void user_test(Position& pos, std::istringstream& is) {
   // enumerates every root attack and every legal defence and emits one JSON
   // object suitable for saving/reloading by tools.
   //   user tsume_verify [max_ply] [max_nodes] [known USI moves...]
-  if (token == "tsume_answer_trace") {
-    std::string v;
-    is >> v;
-    g_rule_trace = v == "on";
-    return;
-  }
-  // デバッグ用: 現局面を無駄合ルールで解く
-  //   user tsume_futile_mate <ms> <max_len>
-  if (token == "tsume_futile_mate") {
-    std::uint64_t ms = 3000;
-    int max_len = 0;
-    is >> ms >> max_len;
-    const auto saved = g_option;
-    g_option.silent = true;
-    g_option.root_is_and_node_if_checked = true;
-    g_option.post_search_level = komori::PostSearchLevel::kMinLength;
-    g_searchers[0].Init(g_option, static_cast<std::uint32_t>(Threads.size()));
-    g_tsume_gen_silent = true;
-    komori::g_futile_interposition = true;
-    const auto out = RunDfpn(pos.sfen(), ms, max_len);
-    komori::g_futile_interposition = false;
-    g_tsume_gen_silent = false;
-    sync_cout << "info string futile_mate " << NodeStateName(out.state) << " len=" << out.len << " pv=" << komori::ToString(out.moves)
-              << sync_endl;
-    g_option = saved;
-    g_searchers[0].Init(saved, static_cast<std::uint32_t>(Threads.size()));
-    return;
-  }
   if (token == "tsume_answer_alternatives") {
     std::string v;
     is >> v;

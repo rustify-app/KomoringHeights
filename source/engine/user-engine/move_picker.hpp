@@ -12,9 +12,6 @@
 
 namespace komori {
 
-/// true のとき玉方の打ち（＝合駒）を生成しない。無駄合を除いた詰み手数の下界を求めるために使う。
-inline bool g_forbid_defender_drops = false;
-
 /// true のとき玉方の打ち（合駒）を2手少なく数える。無駄合は「打つ・取る」の2手を消すだけなので、
 /// この手数は無駄合を除いた詰将棋ルールでの手数の下界になる。PV は求めない（手数だけが意味を持つ）。
 inline bool g_discount_defender_drops = false;
@@ -71,8 +68,7 @@ class MovePicker {
 
     // OrNodeで王手ではない手と違法手を取り除く
     last = std::remove_if(move_list_.data(), last, [&](const auto& m) {
-      return (judge_check && !n.Pos().gives_check(m.move)) || (!or_node && g_forbid_defender_drops && is_drop(m.move)) ||
-             !n.Pos().legal(m.move);
+      return (judge_check && !n.Pos().gives_check(m.move)) || !n.Pos().legal(m.move);
     });
     size_ = last - move_list_.data();
 

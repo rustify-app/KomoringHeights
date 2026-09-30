@@ -56,12 +56,6 @@ class KomoringHeights {
   bool MinLengthProven() const { return min_len_proven_; }
   /// 直前の Search() で証明された詰み手数（合駒割引モードでは割引後の手数）
   MateLen ProvenLen() const { return proven_len_; }
-  /// 直前の Search() における根の各手の結果（Final でない手は探索途中の値）
-  std::vector<std::pair<Move, SearchResult>> RootResults() {
-    std::vector<std::pair<Move, SearchResult>> ret;
-    for (const auto& info : pv_list_.GetPvList()) ret.emplace_back(info.move, info.result);
-    return ret;
-  }
 
   /**
    * @brief Search() の準備を行う。探索開始直前に main_thread から呼び出すこと。
