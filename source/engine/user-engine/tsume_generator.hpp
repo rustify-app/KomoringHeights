@@ -470,9 +470,10 @@ inline std::string CompleteDefenderReserve(const std::string& sfen, bool double_
     for (char c : hands) {
       if (std::isdigit(static_cast<unsigned char>(c))) { count = count * 10 + c - '0'; continue; }
       const int n = count ? count : 1; count = 0;
-      if (int i = index_of(c); i >= 0) {
+      // 受け方の持ち駒は下で盤上・攻め方持ち駒の残りとして作り直すので数えない
+      if (int i = index_of(c); i >= 0 && std::isupper(static_cast<unsigned char>(c))) {
         used[i] += n;
-        if (std::isupper(static_cast<unsigned char>(c))) attacker_hand_count[i] += n;
+        attacker_hand_count[i] += n;
       }
     }
   }

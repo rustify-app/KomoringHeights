@@ -69,6 +69,8 @@ struct VerifyResult {
   bool futile_interposition{false};
   bool prohibited_move{false};
   int hendou_count{0};  // 変同数: 受け方に同手数の最善応手が複数あったノード数の合計
+  bool line_alternative{false};  // 作意途中（最終手を除く攻方手番）に別の詰み手がある
+  std::vector<std::pair<int, Branch>> line_alternatives;  // (手目 0-origin, 別の詰み手)
   std::vector<std::string> unnecessary_squares;
   std::vector<Move> principal;
   std::vector<Branch> attacks;
@@ -304,6 +306,7 @@ class ExhaustiveVerifier {
     result_.alternative_mate = mating_attacks > 1;
     result_.shorter_mate = result_.mate_ply >= 0 && shortest < result_.mate_ply;
     result_.unique = result_.complete && result_.proof == Proof::kMate && mating_attacks == 1;
+    if (result_.proof == Proof::kMate) CheckLineAlternatives(root);
     ValidateIntended(pos);
     if (!options_.intended_usi.empty() && result_.mate_ply >= 0 &&
         result_.mate_ply < static_cast<int>(options_.intended_usi.size())) result_.shorter_mate = true;
@@ -375,8 +378,10 @@ class ExhaustiveVerifier {
         // A non-king interposition which is immediately captured for mate has
         // no effect other than adding two plies. Under tsume rules it is a
         // futile interposition and is excluded from the defender's replies.
-        const PieceType defence_piece = raw_type_of(node.Pos().moved_piece_before(m));
-        const bool futile = defence_piece != KING && child.proof == Proof::kMate && child.len == 1 &&
+        // Only a drop between the king and a ranged checker is an interposition;
+        // captures of the checker and moved interpositions are real defences.
+        const bool futile = is_drop(m) && IsInterposition(node.Pos(), to_sq(m)) &&
+                            child.proof == Proof::kMate && child.len == 1 &&
                             !child.pv.empty() && !is_drop(child.pv.front()) &&
                             to_sq(child.pv.front()) == to_sq(m);
         if (futile) { best.futile_interposition = true; continue; }
@@ -419,6 +424,44 @@ class ExhaustiveVerifier {
     return best;
   }
 
+  static bool IsInterposition(const Position& pos, Square to) {
+    const Square ksq = pos.king_square(pos.side_to_move());
+    Bitboard checkers = pos.checkers();
+    while (checkers) {
+      if (between_bb(ksq, checkers.pop()).test(to)) return true;
+    }
+    return false;
+  }
+
+  // 作意（principal）上の攻方手番で、最終手以外に別の詰み手があれば余詰として記録する。
+  // OR ノードは全王手を探索済みなので、ここでの Search はほぼ置換表の参照で済む。
+  void CheckLineAlternatives(Node& root) {
+    const auto& line = result_.principal;
+    std::size_t made = 0;
+    for (std::size_t i = 0; i + 1 < line.size(); ++i) {
+      if (i % 2 == 0 && i > 0) {
+        const int remain = options_.max_ply - static_cast<int>(i);
+        MovePicker picker(root);
+        for (const auto& ext : picker) {
+          const Move m = ext.move;
+          if (m == line[i] || root.IsRepetitionAfter(m)) continue;
+          root.DoMove(m);
+          const auto child = Search(root, remain - 1);
+          root.UndoMove();
+          if (child.proof == Proof::kUnknown) result_.complete = false;
+          if (child.proof != Proof::kMate) continue;
+          Branch b{m, child.proof, child.len + 1, {m}};
+          b.principal.insert(b.principal.end(), child.pv.begin(), child.pv.end());
+          result_.line_alternatives.emplace_back(static_cast<int>(i), std::move(b));
+          result_.line_alternative = true;
+        }
+      }
+      root.DoMove(line[i]);
+      ++made;
+    }
+    while (made-- > 0) root.UndoMove();
+  }
+
   void ValidateIntended(Position& pos) {
     if (options_.intended_usi.empty()) return;
     std::vector<StateInfo> states(options_.intended_usi.size());
@@ -448,6 +491,7 @@ class ExhaustiveVerifier {
     if (result_.proof == Proof::kMate) result_.reasons.push_back("all replies on the principal AND branches are mated");
     if (result_.proof == Proof::kNoMate) result_.reasons.push_back("no forced mate exists within the requested ply bound");
     if (result_.alternative_mate) result_.reasons.push_back("multiple root checking moves force mate (alternative solution)");
+    if (result_.line_alternative) result_.reasons.push_back("another checking move mates in the middle of the main line (alternative solution)");
     if (result_.symmetric_solutions_collapsed) result_.reasons.push_back("mirror-equivalent root moves were treated as one solution");
     if (result_.repetition) result_.reasons.push_back("a checking sequence repeats and is a failure for the attacker");
     if (result_.illegal_intended) result_.reasons.push_back("the supplied intended line contains an illegal or non-checking attack");
@@ -699,7 +743,7 @@ inline WorkRecord MakeRecord(Position& pos, const std::string& normalized_sfen,
   r.scores = Score(pos, verification, r.techniques);
   r.verification = std::move(verification);
   r.perfect = r.verification.complete && r.verification.proof == Proof::kMate && r.verification.unique &&
-              !r.verification.shorter_mate && !r.verification.piece_surplus &&
+              !r.verification.line_alternative && !r.verification.shorter_mate && !r.verification.piece_surplus &&
               !r.verification.unnecessary_piece && !r.verification.prohibited_move;
   if (!r.perfect) r.aesthetic_reasons.push_back("composition completeness gate failed");
   if (r.verification.mate_ply < 7)
@@ -779,6 +823,7 @@ inline std::string ToJson(const WorkRecord& r, Position& root) {
     << ",\"perfect\":" << (r.perfect ? "true" : "false")
     << ",\"unique\":" << (r.verification.unique ? "true" : "false")
     << ",\"alternativeMate\":" << (r.verification.alternative_mate ? "true" : "false")
+    << ",\"lineAlternativeMate\":" << (r.verification.line_alternative ? "true" : "false")
     << ",\"earlyMate\":" << (r.verification.shorter_mate ? "true" : "false")
     << ",\"noMateBranch\":" << (r.verification.no_mate_branch ? "true" : "false")
     << ",\"pieceSurplus\":" << (r.verification.piece_surplus ? "true" : "false")
@@ -818,6 +863,12 @@ inline std::string ToJson(const WorkRecord& r, Position& root) {
     o << "{\"move\":\"" << USI::move(b.move) << "\",\"status\":\"" << detail::ProofName(b.proof)
       << "\",\"matePly\":" << b.mate_ply << ",\"counterexample\":\""
       << detail::EscapeJson(detail::UsiLine(b.principal)) << "\"}";
+  }
+  o << "],\"lineAlternatives\":[";
+  for (std::size_t i = 0; i < r.verification.line_alternatives.size(); ++i) {
+    const auto& [ply, b] = r.verification.line_alternatives[i]; if (i) o << ',';
+    o << "{\"ply\":" << ply + 1 << ",\"move\":\"" << USI::move(b.move) << "\",\"matePly\":" << b.mate_ply
+      << ",\"line\":\"" << detail::EscapeJson(detail::UsiLine(b.principal)) << "\"}";
   }
   o << "],\"variations\":[";
   for (std::size_t i = 0; i < r.verification.longest_lines.size(); ++i) { if (i) o << ','; o << '"' << detail::EscapeJson(detail::UsiLine(r.verification.longest_lines[i].moves)) << '"'; }

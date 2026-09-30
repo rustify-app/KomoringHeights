@@ -22,7 +22,8 @@ df-pn は「詰むか / 詰まないか」を高速に判定しますが、**別
 | `alternative_mate` | 複数の初手で詰む（余詰） |
 | `shorter_mate` | 想定より短い詰みが存在 |
 | `hendou_count` | 同一手数の別解の総数（変同数） |
-| `futile_interposition` | 即取りされる中合を除外 |
+| `futile_interposition` | 玉と王手駒の間への打ち合で、取って1手で詰むものを除外（移動合・王手駒を取る手は除外しない） |
+| `line_alternative` / `line_alternatives` | 作意途中（最終手を除く）の余詰 |
 | `principal` | 最短の主要変化 |
 | `longest_lines` | 最長の受方応手を全列挙 |
 
@@ -33,6 +34,7 @@ df-pn は「詰むか / 詰まないか」を高速に判定しますが、**別
 - `proof == kMate`
 - `unique == true`（攻方初手唯一）
 - `alternative_mate == false`（余詰なし）
+- `line_alternative == false`（作意途中の攻方手番に別の詰み手なし。最終手は除く）
 - `shorter_mate == false`（短手数解なし）
 - 39/40 枚制を満たす（駒余りなし）
 

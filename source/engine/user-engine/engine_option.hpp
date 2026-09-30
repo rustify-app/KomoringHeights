@@ -163,6 +163,8 @@ struct EngineOption {
 
   /// 探索結果を info string で出さない。ベンチマーク用のため `USI::OptionsMap` には登録しない
   bool silent{false};
+  /// 0 より大きいとき、この手数以内の詰みだけを探す（不詰＝この手数以内に詰みなし）。USI には登録しない
+  Depth max_mate_len{0};
 
 #if defined(USE_DEEP_DFPN)
   Depth deep_dfpn_d;   ///< deep df-pn の D 値
