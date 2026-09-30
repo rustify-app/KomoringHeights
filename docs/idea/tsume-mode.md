@@ -13,6 +13,30 @@ user tsume_verify <上限手数> <上限ノード数> [既知のUSI手順...]
 
 結果は `info string tsume_json {...}` として出力されます。詰み手数、USI手順、人間向け手順、同手数変化、余詰、早詰、千日手、駒余り、不要駒、探索ノード数、技巧、11種の評価スコアと判定理由を含みます。
 
+## 完全作解答モード（df-pn ベース）
+
+全幅探索の `tsume_verify` は 15 手を超えると現実的な時間で終わらないため、詰パラ級の作品を解くときは次のコマンドを使います。
+
+```text
+position sfen <SFEN>
+user tsume_answer [部分問題1つあたりms=3000] [全体df-pn ms=30000] [作意USI手順...]
+```
+
+KomoringHeights の df-pn は無駄合も有効な応手として数えるので、その手数は詰将棋ルールでの手数の**上界**にしかなりません。`tsume_answer` は df-pn を部分問題の判定器として使い、次の規則で詰将棋ルールの解を求めます。
+
+- **無駄合**: 玉方の打ち合（王手している飛び駒と玉の間への打）は、取った後に取った駒を持駒から除いても詰むなら応手から外す（移動合と王手駒を取る手は外さない）
+- **攻方ノード**: 合駒を禁止した df-pn の手数（**下界**）の小さい王手から調べ、最短を求める
+- **玉方ノード**: 合駒ありの df-pn の手数（上界）の大きい応手から調べ、無駄合を除いた最長を求める。同手数なら駒が余らない手順を選ぶ
+- **余詰**: 作意（合法でなければ求めた解）の最終手以外の攻方手番で、他の王手が残り手数以内に詰むかを調べる。合駒なしでも詰まなければ詰まないと判定し、詰めばルール上の手数を求める
+
+df-pn の呼び出しは全て手数上限付きで行い、時間切れで判定できなかった部分問題は `unknown` として報告します（`info string [tsume_answer] unresolved ...`）。結果は `info string tsume_answer {...}` の JSON で、`rawMatePly`（df-pn 単体の手数）、`matePly` / `usi`（ルール上の解）、`intendedLegal` / `sameAsIntended`、`alternatives`（余詰・早詰・未解決）、`pieceSurplus`、`perfect` を含みます。残り手数より長い別詰（迂回を含む）は調べません。
+
+KIF（局面図+作意）をまとめて検査するには:
+
+```text
+python3 tools/tsume_answer_batch.py source/KomoringHeights-by-gcc *.kif --node-ms 3000 --raw-ms 30000 --jsonl out.jsonl
+```
+
 ## 保存と再検証
 
 ```text

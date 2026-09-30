@@ -21,6 +21,101 @@
 #include "transposition_table.hpp"
 
 namespace komori {
+/// 無駄合判定で試す「取る手」の最大数
+inline constexpr std::size_t kMaxFutileCaptures = 4;
+
+/**
+ * @brief 玉方の手 `drop` が王手駒と玉の間への打ち合かどうか（無駄合判定の対象か）
+ * @param n    現局面（玉方手番）
+ */
+inline bool IsFutileCandidate(const Node& n, Move drop) {
+  if (!g_futile_interposition || n.IsOrNode() || !is_drop(drop)) {
+    return false;
+  }
+  const Bitboard checkers = n.Pos().checkers();
+  if (checkers.pop_count() != 1) {
+    return false;
+  }
+  Bitboard tmp = checkers;
+  return between_bb(n.KingSquare(), tmp.pop()).test(to_sq(drop));
+}
+
+/**
+ * @brief 打ち合 `drop` の後、その駒を取って王手する攻方の手を列挙する（成・不成を含め最大 kMaxFutileCaptures 個）
+ * @note 王手している駒で取る手を先に並べる
+ */
+inline FixedSizeStack<Move, kMaxFutileCaptures> FutileCaptures(Node& n, Move drop) {
+  FixedSizeStack<Move, kMaxFutileCaptures> ret;
+  const Square to = to_sq(drop);
+  Bitboard tmp = n.Pos().checkers();
+  const Square checker_sq = tmp.pop();
+  n.DoMove(drop);
+  std::array<Move, 16> others{};
+  std::size_t n_others = 0;
+  for (const auto& ext : MoveList<LEGAL_ALL>(n.Pos())) {
+    const Move m = ext.move;
+    // 攻方の手は王手でなければならない
+    if (is_drop(m) || to_sq(m) != to || !n.Pos().gives_check(m)) {
+      continue;
+    }
+    if (from_sq(m) == checker_sq && ret.size() < kMaxFutileCaptures) {
+      ret.Push(m);
+    } else if (n_others < others.size()) {
+      others[n_others++] = m;
+    }
+  }
+  for (std::size_t i = 0; i < n_others && ret.size() < kMaxFutileCaptures; ++i) {
+    ret.Push(others[i]);
+  }
+  n.UndoMove();
+  return ret;
+}
+
+/**
+ * @brief 無駄合判定用の局面 V へ進める。V は `drop` を打ち、`capture` で取り、取った駒を玉方に返した局面。
+ * @note 必ず `LeaveFutileProbe()` で戻すこと
+ */
+inline void EnterFutileProbe(Node& n, Move drop, Move capture) {
+  n.DoMove(drop);
+  n.DoMove(capture);
+  n.StealCapturedPiece();
+}
+
+/// `EnterFutileProbe()` で進めた局面を戻す
+inline void LeaveFutileProbe(Node& n) {
+  n.UnstealCapturedPiece();
+  n.UndoMove();
+  n.UndoMove();
+}
+
+/**
+ * @brief 無駄合判定用の局面 V に割り当てる残り手数
+ *
+ * 無駄合かどうかは V が詰むかだけで決まり、V の手数は問わない。ただし上限なしだと V が不詰のときの証明が重いので、
+ * 現局面の残り手数を上限として調べる（V がそれより長くかかるなら、その合駒は手数を延ばす有効な合駒とみなす）。
+ */
+inline MateLen ProbeLen(MateLen len) {
+  // 注意: 無駄合かどうかが探索の手数上限に依存するため、上限を変えて探索し直す MinLength の結果が
+  // まれに食い違う（誤って短い手数を返す）。tsume_answer では解答手順を組み立て直して検証している。
+  return len;
+}
+
+/// 子局面に割り当てる残り手数。合駒割引モードでは玉方の打ちに2手余分に与える。
+inline MateLen ChildMateLen(bool or_node, Move move, MateLen len) {
+  if (!or_node && g_discount_defender_drops && is_drop(move)) {
+    return std::min(len + 1, kDepthMaxMateLen);
+  }
+  return len - 1;
+}
+
+/// 子局面の手数を現局面から見た手数に直す（合駒割引モードでは玉方の打ちを2手引く）
+inline MateLen DiscountedChildLen(bool or_node, Move move, MateLen child_len) {
+  if (!or_node && g_discount_defender_drops && is_drop(move)) {
+    return child_len.Len() >= 1 ? child_len - 2 : kMinus1MateLen;
+  }
+  return child_len;
+}
+
 namespace detail {
 /// 強制的に max 値によるδ値計算へ切り替えるしきい値。
 constexpr PnDn kForceSumPnDn = kInfinitePnDn / 1024;
@@ -163,15 +258,42 @@ class LocalExpansion {
         // 子局面が OR node  -> 1手詰以上
         // 子局面が AND node -> 0手詰以上
         const auto min_len = or_node_ ? MateLen{0} : MateLen{1};
-        if (len_ < min_len + 1) {
-          // どう見ても詰まない
-          result = SearchResult::MakeFinal<false>(hand_after, min_len - 1, 1);
-          goto CHILD_LOOP_END;
+        const auto child_len = ChildMateLen(or_node_, move.move, len_);
+        query = tt.BuildChildQuery(n, move.move);
+
+        // 無駄合判定: 王手駒と玉の間への打ち合は、取って駒を返した局面 V が詰むかを先に調べる。
+        // 実際の子の結果（無駄合も応手に数えた長い手数）より先に見ないと、手数を取り違える。
+        // 取り方が複数あれば順に試し、どれか1つで V が詰めば無駄合。
+        bool probing_now = false;
+        if (IsFutileCandidate(n, move.move)) {
+          const auto captures = FutileCaptures(nn, move.move);
+          auto& probe = probes_[i_raw];
+          probe.count = static_cast<std::uint8_t>(captures.size());
+          for (std::size_t k = 0; k < captures.size(); ++k) {
+            probe.captures[k] = captures[k];
+            EnterFutileProbe(nn, move.move, captures[k]);
+            probe.queries[k] = tt.BuildQuery(nn);
+            LeaveFutileProbe(nn);
+          }
+          if (const auto r = NextProbe(i_raw, 0); r.has_value()) {
+            result = *r;
+            if (!probing_[i_raw]) {
+              goto CHILD_LOOP_END;  // 無駄合と確定
+            }
+            probing_now = true;
+          }
+          // 全ての取り方で V が不詰なら有効な合駒なので、通常の子として扱う
         }
 
-        query = tt.BuildChildQuery(n, move.move);
-        result =
-            query.LookUp(does_have_old_child_, len - 1, [&n, &move = move]() { return InitialPnDn(n, move.move); });
+        if (!probing_now) {
+          if (child_len + 1 < min_len + 1) {
+            // どう見ても詰まない
+            result = SearchResult::MakeFinal<false>(hand_after, min_len - 1, 1);
+            goto CHILD_LOOP_END;
+          }
+          result = query.LookUp(does_have_old_child_, child_len,
+                                [&n, &move = move]() { return InitialPnDn(n, move.move); });
+        }
 
         if (!result.IsFinal()) {
           if (!IsSumDeltaNode(n, move.move) || result.Delta(or_node_) >= detail::kForceSumPnDn) {
@@ -193,7 +315,8 @@ class LocalExpansion {
             next_dep = delayed_move_list_.Prev(*next_dep);
           }
 
-          if (!i_is_skipped && !or_node_ && first_search && result.GetUnknownData().is_first_visit) {
+          if (!i_is_skipped && !or_node_ && !probing_[i_raw] && first_search &&
+              result.GetUnknownData().is_first_visit) {
             nn.DoMove(move.move);
             if (auto res = detail::CheckObviousFinalOrNode(nn); res.has_value()) {
               result = *res;
@@ -253,6 +376,14 @@ class LocalExpansion {
    */
   bool FrontIsFirstVisit() const { return FrontResult().GetUnknownData().is_first_visit; }
   /**
+   * @brief 最善手の子が無駄合判定中なら、V へ進むための取る手を返す（そうでなければ MOVE_NONE）
+   * @pre !CurrentResult().IsFinal()
+   */
+  Move FrontProbeCapture() const {
+    const auto i_raw = idx_[excluded_moves_];
+    return probing_[i_raw] ? probes_[i_raw].captures[probes_[i_raw].index] : MOVE_NONE;
+  }
+  /**
    * @brief 最善手の Sum Mask
    * @pre !CurrentResult().IsFinal()
    */
@@ -291,13 +422,32 @@ class LocalExpansion {
    * @param search_result 最善手の子の評価値
    * @pre !empty()
    */
-  void UpdateBestChild(const SearchResult& search_result) {
+  void UpdateBestChild(const SearchResult& raw_search_result) {
     const auto old_i_raw = idx_[excluded_moves_];
     const auto& query = queries_[old_i_raw];
     auto& result = results_[old_i_raw];
 
-    result = search_result;
-    query.SetResult(search_result, key_hand_pair_);
+    SearchResult search_result = raw_search_result;
+    if (probing_[old_i_raw]) {
+      // 無駄合判定中の子。raw_search_result は V の探索結果（V 自身の置換表エントリには保存済み）
+      if (raw_search_result.IsFinal() && raw_search_result.Pn() == 0) {
+        // V が詰み → 無駄合。応手として数えない
+        probing_[old_i_raw] = false;
+        search_result = FutileResult(raw_search_result);
+      } else if (raw_search_result.IsFinal()) {
+        // この取り方の V は不詰。次の取り方を試し、全て不詰なら有効な合駒として通常の子に戻す
+        if (const auto r = NextProbe(old_i_raw, probes_[old_i_raw].index + 1); r.has_value()) {
+          search_result = *r;
+        } else {
+          bool dummy = false;
+          search_result = query.LookUp(dummy, len_ - 1, []() { return std::make_pair(PnDn{1}, PnDn{1}); });
+        }
+      }
+      result = search_result;
+    } else {
+      result = search_result;
+      query.SetResult(search_result, key_hand_pair_);
+    }
     if (!result.IsFinal() && result.Delta(or_node_) >= detail::kForceSumPnDn) {
       sum_mask_.Reset(old_i_raw);
     }
@@ -549,7 +699,7 @@ class LocalExpansion {
     // excluded_moves_ に関係なく最も良い手がほしいので FrontResult() は使えない
     const auto& result = results_[idx_.front()];
     const auto best_move = mp_[idx_[0]];
-    const auto mate_len = result.Len() + 1;
+    const auto mate_len = DiscountedChildLen(or_node_, best_move, result.Len()) + 1;
     const auto amount = result.Amount() + mp_.size() - 1;
     const auto after_hand = result.GetFinalData().hand;
 
@@ -630,8 +780,9 @@ class LocalExpansion {
 
         set.Update(result.GetFinalData().hand);
         amount = std::max(amount, result.Amount());
-        if (result.Len() > mate_len) {
-          mate_len = result.Len();
+        const auto child_len = DiscountedChildLen(or_node_, mp_[i_raw], result.Len());
+        if (child_len > mate_len) {
+          mate_len = child_len;
         }
       }
       amount += std::max<SearchAmount>(mp_.size(), 1) - 1;
@@ -695,6 +846,45 @@ class LocalExpansion {
   std::array<SearchResult, kMaxCheckMovesPerNode> results_;
   /// 子のクエリ一覧。コンストラクト時に作ったクエリを使い回すことで高速化できる
   std::array<tt::Query, kMaxCheckMovesPerNode> queries_;
+  /// 無駄合判定中の子（V の結果を子の結果として使っている）
+  std::array<bool, kMaxCheckMovesPerNode> probing_{};
+  /// 打ち合ごとの無駄合判定の状態
+  struct FutileProbe {
+    std::uint8_t count{0};  ///< 試す取り方の数
+    std::uint8_t index{0};  ///< 現在調べている取り方
+    std::array<Move, kMaxFutileCaptures> captures{};
+    std::array<tt::Query, kMaxFutileCaptures> queries;
+  };
+  std::array<FutileProbe, kMaxCheckMovesPerNode> probes_;
+
+  /**
+   * @brief 取り方 `from` 番目以降の V を置換表で調べ、子 `i_raw` の結果を決める
+   * @return 無駄合と確定（probing_ = false）または V を探索中（probing_ = true）の結果。全て不詰なら nullopt
+   */
+  std::optional<SearchResult> NextProbe(std::uint32_t i_raw, std::size_t from) {
+    auto& probe = probes_[i_raw];
+    for (std::size_t k = from; k < probe.count; ++k) {
+      bool dummy = false;
+      const auto v_result = probe.queries[k].LookUp(dummy, ProbeLen(len_), []() {
+        return std::make_pair(PnDn{1}, PnDn{1});
+      });
+      probe.index = static_cast<std::uint8_t>(k);
+      if (v_result.IsFinal() && v_result.Pn() == 0) {
+        probing_[i_raw] = false;
+        return FutileResult(v_result);
+      } else if (!v_result.IsFinal()) {
+        probing_[i_raw] = true;
+        return v_result;
+      }
+    }
+    probing_[i_raw] = false;
+    return std::nullopt;
+  }
+
+  /// 無駄合と判明した子の結果。手数は -1 として扱い、最長抵抗の計算に影響させない
+  static SearchResult FutileResult(const SearchResult& v_result) {
+    return SearchResult::MakeFinal<true>(v_result.GetFinalData().hand, kMinus1MateLen, v_result.Amount());
+  }
 
   /// 現局面の評価値が古い探索情報に基づくものかどうか。TCA の探索延長の判断に用いる。
   bool does_have_old_child_{false};

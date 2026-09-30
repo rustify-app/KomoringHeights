@@ -83,11 +83,30 @@ std::pair<Move, MateLen> LookUpBestMoveOrNode(tt::TranspositionTable& tt, Node& 
   return {best_move, best_proven_len};
 }
 
+/// 置換表上で無駄合と判明している打ち合か
+bool IsKnownFutile(tt::TranspositionTable& tt, Node& n, Move move) {
+  if (!IsFutileCandidate(n, move)) {
+    return false;
+  }
+  for (const auto capture : FutileCaptures(n, move)) {
+    EnterFutileProbe(n, move, capture);
+    const auto [disproven_len, proven_len] = tt.BuildQuery(n).FinalRange();
+    LeaveFutileProbe(n);
+    if (proven_len < kDepthMaxPlus1MateLen) {
+      return true;
+    }
+  }
+  return false;
+}
+
 std::pair<Move, MateLen> LookUpBestMoveAndNode(tt::TranspositionTable& tt, Node& n) {
   Move best_move = MOVE_NONE;
   MateLen best_proven_len = kMinus1MateLen;
   MateLen best_disproven_len = kDepthMaxPlus1MateLen;
   for (const auto move : MovePicker{n}) {
+    if (IsKnownFutile(tt, n, move.move)) {
+      continue;
+    }
     const auto query = tt.BuildChildQuery(n, move.move);
     const auto [disproven_len, proven_len] = query.FinalRange();
     if (proven_len > best_proven_len || (proven_len == best_proven_len && disproven_len < best_disproven_len)) {
@@ -184,7 +203,12 @@ NodeState KomoringHeights::Search(const Position& n, bool is_root_or_node) {
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 std::pair<NodeState, MateLen> KomoringHeights::SearchMainLoop(Node& n) {
   NodeState node_state = NodeState::kUnknown;
-  auto len{kDepthMaxMateLen};
+  auto len{option_.max_mate_len > 0 ? MateLen{static_cast<std::uint32_t>(option_.max_mate_len)} : kDepthMaxMateLen};
+  bool proven_once = false;
+  if (tl_thread_id == 0) {
+    min_len_proven_ = false;
+    proven_len_ = kDepthMaxMateLen;
+  }
 
   for (Depth i = 0; i < kDepthMax; ++i) {
     const auto result = SearchEntry(n, len);
@@ -202,11 +226,17 @@ std::pair<NodeState, MateLen> KomoringHeights::SearchMainLoop(Node& n) {
 
     if (result.Pn() == 0) {
       node_state = NodeState::kProven;
+      proven_once = true;
 
       // len 以下の手数の詰みが帰ってくるはず
       KOMORI_PRECONDITION(result.Len().Len() <= len.Len());
       if (tl_thread_id == 0) {
+        proven_len_ = result.Len();
         best_moves_ = pv_list_.BestMoves();
+        if (result.Len() == kZeroMateLen) {
+          // 玉方手番で応手が無い（または全て無駄合）: 手順は空
+          best_moves_.clear();
+        }
         if (!option_.silent) {
           sync_cout << CurrentInfo() << "# " << OrdinalNumber(i + 1) << " result: mate in " << best_moves_.size()
                     << "(upper_bound:" << result.Len() << ")" << sync_endl;
@@ -220,6 +250,9 @@ std::pair<NodeState, MateLen> KomoringHeights::SearchMainLoop(Node& n) {
       }
 
       if (result.Len().Len() <= 1) {
+        if (tl_thread_id == 0) {
+          min_len_proven_ = true;
+        }
         break;
       }
 
@@ -230,13 +263,18 @@ std::pair<NodeState, MateLen> KomoringHeights::SearchMainLoop(Node& n) {
         sync_cout << info << "Failed to detect PV" << sync_endl;
       }
 
-      if (len != kDepthMaxMateLen) {
+      if (proven_once) {
         len = len + 2;
-        if (tl_thread_id == 0) {
+        if (tl_thread_id == 0 && g_discount_defender_drops) {
+          proven_len_ = len;
+          min_len_proven_ = result.Dn() == 0;
+        } else if (tl_thread_id == 0) {
+          proven_len_ = len;
           best_moves_ = GetMatePath(n, len, true);
           const auto final_result = SearchResult::MakeFinal<true>(n.OrHand(), len - 1, result.Amount());
           pv_list_.Update(best_moves_[0], final_result, 0, best_moves_);
           score_ = old_score;
+          min_len_proven_ = result.Dn() == 0;
         }
       } else {
         node_state = result.GetNodeState();
@@ -321,9 +359,18 @@ SearchResult KomoringHeights::SearchImplForRoot(Node& n, PnDn thpn, PnDn thdn, M
     const bool is_first_search = local_expansion.FrontIsFirstVisit();
     const BitSet64 sum_mask = local_expansion.FrontSumMask();
     const auto [child_thpn, child_thdn] = local_expansion.FrontPnDnThresholds(thpn, thdn);
+    // 無駄合判定中の子は、実際の子ではなく V（取って駒を返した局面）を探索する
+    const auto probe_capture = local_expansion.FrontProbeCapture();
+    const bool probing = probe_capture != MOVE_NONE;
+    if (probing) {
+      EnterFutileProbe(n, best_move, probe_capture);
+    }
+    const auto child_len = probing ? ProbeLen(len) : ChildMateLen(n.IsOrNode(), best_move, len);
 
-    n.DoMove(best_move);
-    auto& child_expansion = expansion_list_[tl_thread_id].Emplace(tt_, n, len - 1, is_first_search, sum_mask);
+    if (!probing) {
+      n.DoMove(best_move);
+    }
+    auto& child_expansion = expansion_list_[tl_thread_id].Emplace(tt_, n, child_len, is_first_search, sum_mask);
 
     SearchResult child_result;
     if (is_first_search) {
@@ -336,16 +383,20 @@ SearchResult KomoringHeights::SearchImplForRoot(Node& n, PnDn thpn, PnDn thdn, M
         goto CHILD_SEARCH_END;
       }
     }
-    child_result = SearchImpl(n, child_thpn, child_thdn, len - 1, inc_flag);
+    child_result = SearchImpl(n, child_thpn, child_thdn, child_len, inc_flag);
 
   CHILD_SEARCH_END:
     expansion_list_[tl_thread_id].Pop();
-    n.UndoMove();
+    if (probing) {
+      LeaveFutileProbe(n);
+    } else {
+      n.UndoMove();
+    }
 
     local_expansion.UpdateBestChild(child_result);
     curr_result = local_expansion.CurrentResult(n);
 
-    if (tl_thread_id == 0 && n.GetDepth() == 0 && child_result.IsFinal()) {
+    if (tl_thread_id == 0 && n.GetDepth() == 0 && child_result.IsFinal() && !probing) {
       // Final な手を見つけたとき、pv_list_ へその手順を記録しておく
       UpdateFinalPv(n, best_move, child_result);
     }
@@ -404,11 +455,20 @@ SearchResult KomoringHeights::SearchImpl(Node& n, PnDn thpn, PnDn thdn, MateLen 
     const bool is_first_search = local_expansion.FrontIsFirstVisit();
     const BitSet64 sum_mask = local_expansion.FrontSumMask();
     const auto [child_thpn, child_thdn] = local_expansion.FrontPnDnThresholds(thpn, thdn);
+    // 無駄合判定中の子は、実際の子ではなく V（取って駒を返した局面）を探索する
+    const auto probe_capture = local_expansion.FrontProbeCapture();
+    const bool probing = probe_capture != MOVE_NONE;
+    if (probing) {
+      EnterFutileProbe(n, best_move, probe_capture);
+    }
+    const auto child_len = probing ? ProbeLen(len) : ChildMateLen(n.IsOrNode(), best_move, len);
 
-    n.DoMove(best_move);
+    if (!probing) {
+      n.DoMove(best_move);
+    }
 
     // 子局面を展開する。展開した expansion は UndoMove() の直前に忘れずに開放しなければならない。
-    auto& child_expansion = expansion_list_[tl_thread_id].Emplace(tt_, n, len - 1, is_first_search, sum_mask);
+    auto& child_expansion = expansion_list_[tl_thread_id].Emplace(tt_, n, child_len, is_first_search, sum_mask);
 
     SearchResult child_result;
     if (is_first_search) {
@@ -427,11 +487,15 @@ SearchResult KomoringHeights::SearchImpl(Node& n, PnDn thpn, PnDn thdn, MateLen 
         goto CHILD_SEARCH_END;
       }
     }
-    child_result = SearchImpl(n, child_thpn, child_thdn, len - 1, inc_flag);
+    child_result = SearchImpl(n, child_thpn, child_thdn, child_len, inc_flag);
 
   CHILD_SEARCH_END:
     expansion_list_[tl_thread_id].Pop();
-    n.UndoMove();
+    if (probing) {
+      LeaveFutileProbe(n);
+    } else {
+      n.UndoMove();
+    }
 
     local_expansion.UpdateBestChild(child_result);
     curr_result = local_expansion.CurrentResult(n);
@@ -546,6 +610,15 @@ std::pair<Move, MateLen> KomoringHeights::GetBestMoveAndNode(Node& n, MateLen le
 }
 
 void KomoringHeights::UpdateFinalPv(Node& n, Move move, const SearchResult& result) {
+  // 無駄合（手数 -1 で証明済みとした打ち合）は応手に数えないので PV に載せない
+  if (result.Pn() == 0 && result.Len() == kMinus1MateLen) {
+    return;
+  }
+  // 合駒割引モードでは手数が実際の手順と一致しないので PV を作らず、手ごとの結果だけ記録する
+  if (g_discount_defender_drops) {
+    pv_list_.Update(move, result, 1, std::vector<Move>{move});
+    return;
+  }
   if (result.Pn() == 0) {
     std::vector<Move> pv{move};
     n.DoMove(move);

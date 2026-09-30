@@ -147,6 +147,23 @@ class Node {
     moves_.Pop();
   }
 
+  /**
+   * @brief 直前の手で取った駒を相手（玉方）に返す。無駄合判定用。
+   * @note 局面を戻すときは必ず `UnstealCapturedPiece()` を先に呼んでから `UndoMove()` すること。
+   */
+  void StealCapturedPiece() {
+    const auto captured_pr = raw_type_of(Pos().state()->capturedPiece);
+    path_key_ = PathKeyAfterSteal(path_key_, captured_pr, depth_);
+    Pos().steal_hand(captured_pr);
+  }
+
+  /// `StealCapturedPiece()` の逆操作
+  void UnstealCapturedPiece() {
+    const auto captured_pr = raw_type_of(Pos().state()->capturedPiece);
+    path_key_ = PathKeyAfterGive(path_key_, captured_pr, depth_);
+    Pos().give_hand(captured_pr);
+  }
+
   /// 現局面が千日手かどうか
   std::optional<Depth> IsRepetition() const { return visit_history_.Contains(BoardKey(), this->OrHand()); }
 

@@ -52,6 +52,16 @@ class KomoringHeights {
    * @return 詰み手順
    */
   const std::vector<Move>& BestMoves() const { return best_moves_; }
+  /// 直前の Search() で、BestMoves() の手数が最短であることまで証明できたかどうか
+  bool MinLengthProven() const { return min_len_proven_; }
+  /// 直前の Search() で証明された詰み手数（合駒割引モードでは割引後の手数）
+  MateLen ProvenLen() const { return proven_len_; }
+  /// 直前の Search() における根の各手の結果（Final でない手は探索途中の値）
+  std::vector<std::pair<Move, SearchResult>> RootResults() {
+    std::vector<std::pair<Move, SearchResult>> ret;
+    for (const auto& info : pv_list_.GetPvList()) ret.emplace_back(info.move, info.result);
+    return ret;
+  }
 
   /**
    * @brief Search() の準備を行う。探索開始直前に main_thread から呼び出すこと。
@@ -172,6 +182,8 @@ class KomoringHeights {
   SearchMonitor monitor_;  ///< 探索モニター
 
   std::vector<Move> best_moves_;                 ///< 詰み手順
+  bool min_len_proven_{false};                   ///< best_moves_ の手数が最短と証明済みか
+  MateLen proven_len_{kDepthMaxMateLen};         ///< 証明された詰み手数
   std::deque<ExpansionStack> expansion_list_{};  ///< 局面展開のための一時領域
   Score score_{};  ///< 現在の探索評価値。余詰探索中に CurrentInfo() で取得できるようにここにおいておく
 
