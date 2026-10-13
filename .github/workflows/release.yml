@@ -5,7 +5,7 @@
 # 「完全作解答モード（df-pn ベース）」) and publishes a GitHub Release with:
 #
 #   KomoringHeights-<tag>-linux-x86_64-avx2   static ELF, no runtime deps
-#   KomoringHeights-<tag>-windows-x64-avx2.exe   static MinGW build
+#   KomoringHeights-<tag>-windows-x64-avx2.exe   static MinGW (UCRT64) build
 #   SHA256SUMS
 #
 # The Linux binary is what Shogi Dojo's tsume agent downloads and verifies
@@ -55,6 +55,7 @@ jobs:
       - name: Build
         working-directory: source
         run: |
+          mkdir -p ../dist
           make -j"$(nproc)" normal \
             YANEURAOU_EDITION=USER_ENGINE \
             TARGET_CPU=AVX2 \
@@ -82,7 +83,7 @@ jobs:
           if-no-files-found: error
 
   build-windows:
-    name: Windows x64 (AVX2, MinGW static)
+    name: Windows x64 (AVX2, MinGW UCRT64 static)
     runs-on: windows-2025
     defaults:
       run:
@@ -92,15 +93,16 @@ jobs:
 
       - uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
           install: >-
             make
-            mingw-w64-x86_64-gcc
+            mingw-w64-ucrt-x86_64-gcc
 
       - name: Build
         working-directory: source
         run: |
+          mkdir -p ../dist
           make -j"$(nproc)" normal \
             YANEURAOU_EDITION=USER_ENGINE \
             TARGET_CPU=AVX2 \
