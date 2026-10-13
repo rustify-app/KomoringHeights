@@ -1,282 +1,184 @@
-name: CI Build&Release
+# Release build for the Rustify fork of KomoringHeights.
+#
+# Pushing a `kh-v*` tag builds the USI engine (USER_ENGINE edition, which
+# carries `user tsume_answer` — see docs/idea/tsume-mode.md,
+# 「完全作解答モード（df-pn ベース）」) and publishes a GitHub Release with:
+#
+#   KomoringHeights-<tag>-linux-x86_64-avx2   static ELF, no runtime deps
+#   KomoringHeights-<tag>-windows-x64-avx2.exe   static MinGW build
+#   SHA256SUMS
+#
+# The Linux binary is what Shogi Dojo's tsume agent downloads and verifies
+# (infra/k8s/rustify/51-tsume-agent.yaml in the app repo), so it is linked
+# statically: it then runs in any x86-64 image regardless of its glibc.
+#
+# `workflow_dispatch` builds and smoke-tests without publishing, unless a tag
+# is given, in which case it (re)publishes that tag's release.
+#
+# The previous version of this file used actions/checkout@v2,
+# upload-artifact@v2 and actions/create-release@v1, which GitHub now refuses
+# to run; it also built only Windows/Android/macOS archives.
+name: Release
 
 on:
   push:
     tags:
-      # 動作条件を変えたい場合、 workflow-syntax-for-github-actions#フィルタパターンのチートシート 参照。
-      # https://docs.github.com/ja/free-pro-team@latest/actions/reference/workflow-syntax-for-github-actions
       - "kh-v*"
       - "kh-V*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish a release for (empty: build only)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  # A 1-move tsume: G*5b is the only mate. Used to prove the built binary
+  # answers `user tsume_answer` before anything is published.
+  SMOKE_SFEN: "4k4/9/4P4/9/9/9/9/9/9 b G2r2b3g4s4n4l17p 1"
 
 jobs:
-  build-msys2-windows:
-    # windows-latest = windows-2019
-    # https://docs.github.com/ja/actions/using-github-hosted-runners/about-github-hosted-runners
-    # https://github.com/actions/virtual-environments/blob/main/images/win/Windows2019-Readme.md
-    runs-on: windows-latest
-
-    strategy:
-      matrix:
-        target: [normal]
-        archcpu:
-          - "ZEN3,ZEN2,ZEN1,AVX512VNNI"
-          - "AVXVNNI,AVX512,AVX2,SSE42"
-          - "SSE41,SSSE3,SSE2,NO_SSE"
-          - "OTHER"
-        edition:
-          - USER_ENGINE
-        compiler:
-          - clang++
-          - g++
-        exclude:
-          # Release target exclude: archcpu ZEN3,AVXVNNI,OTHER
-          # `-march=cascadelake`: LLVM8, GCC9 support (AVX512VNNI)
-          # `-march=alderlake` : LLVM12, GCC11 support (AVX-VNNI)
-          # `-march=znver3`: LLVM12, GCC11 support
-          - archcpu: "OTHER"
-          # Release target exclude: archcpu 'SSE41,SSSE3,SSE2,NO_SSE' and target 'tournament,evallearn'
-          - target: tournament
-            archcpu: "SSE41,SSSE3,SSE2,NO_SSE"
-          - target: evallearn
-            archcpu: "SSE41,SSSE3,SSE2,NO_SSE"
-          - target: gensfen
-            archcpu: "SSE41,SSSE3,SSE2,NO_SSE"
+  build-linux:
+    name: Linux x86-64 (AVX2, static)
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout own repository
-        uses: actions/checkout@v2
-        with:
-          path: main
+      - uses: actions/checkout@v7
 
-      - name: Install pkg
+      - name: Toolchain
         run: |
-          $ErrorActionPreference = 'Continue'
-          C:\msys64\usr\bin\bash.exe -lc 'pacman --needed --noconfirm -Syuu'
-          C:\msys64\usr\bin\bash.exe -lc 'pacman --needed --noconfirm -Syuu'
-          C:\msys64\usr\bin\bash.exe -lc 'pacman --needed --noconfirm -Syuu pactoys'
-          C:\msys64\usr\bin\bash.exe -lc 'pacboy --needed --noconfirm -Sy clang:m lld:m openblas:x openmp:x toolchain:m base-devel:'
-          $ErrorActionPreference = 'Stop'
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential
 
-      - name: make
+      - name: Build
+        working-directory: source
         run: |
-          $env:PATH+=';C:\msys64';
-          .\main\script\msys2_build.ps1 -Edition ${{ matrix.edition }} -Compiler ${{ matrix.compiler }} -Target ${{ matrix.target }} -Cpu ${{ matrix.archcpu }}
-        shell: pwsh
+          make -j"$(nproc)" normal \
+            YANEURAOU_EDITION=USER_ENGINE \
+            TARGET_CPU=AVX2 \
+            COMPILER=g++ \
+            EXTRA_LDFLAGS=-static \
+            TARGET=../dist/KomoringHeights-linux-x86_64-avx2
+          file ../dist/KomoringHeights-linux-x86_64-avx2
+          # Fail if anything dynamic slipped in.
+          if ldd ../dist/KomoringHeights-linux-x86_64-avx2 2>&1 | grep -q '=>'; then
+            ldd ../dist/KomoringHeights-linux-x86_64-avx2
+            exit 1
+          fi
 
-      - uses: actions/upload-artifact@v2
+      - name: Smoke test (user tsume_answer)
+        run: |
+          out=$(printf 'usi\nisready\nposition sfen %s\nuser tsume_answer 1000 5000\nquit\n' "$SMOKE_SFEN" \
+            | timeout 120 ./dist/KomoringHeights-linux-x86_64-avx2)
+          echo "$out" | tail -n 20
+          echo "$out" | grep -F 'info string tsume_answer {' | grep -F '"status":"mate"' | grep -F '"matePly":1'
+
+      - uses: actions/upload-artifact@v7
         with:
-          name: build-windows_${{ github.run_number }}_${{ github.sha }}
-          path: ./main/build/**/*
+          name: linux
+          path: dist/*
+          if-no-files-found: error
 
-  build-android:
-    # ubuntu-latest = ubuntu-18.04 => ubuntu-20.04
-    # https://github.com/actions/virtual-environments/issues/1816
-    # https://docs.github.com/ja/free-pro-team@latest/actions/reference/specifications-for-github-hosted-runners
-    runs-on: ubuntu-22.04
-
-    strategy:
-      matrix:
-        edition:
-          - USER_ENGINE
-
+  build-windows:
+    name: Windows x64 (AVX2, MinGW static)
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: msys2 {0}
     steps:
-      - name: Setup Android NDK r26b
-        uses: nttld/setup-ndk@v1
+      - uses: actions/checkout@v7
+
+      - uses: msys2/setup-msys2@v2
         with:
-          ndk-version: r26b
+          msystem: MINGW64
+          update: true
+          install: >-
+            make
+            mingw-w64-x86_64-gcc
 
-      - name: Checkout own repository
-        uses: actions/checkout@v2
+      - name: Build
+        working-directory: source
+        run: |
+          make -j"$(nproc)" normal \
+            YANEURAOU_EDITION=USER_ENGINE \
+            TARGET_CPU=AVX2 \
+            COMPILER=g++ \
+            TARGET=../dist/KomoringHeights-windows-x64-avx2.exe
+
+      - name: Smoke test (user tsume_answer)
+        run: |
+          out=$(printf 'usi\nisready\nposition sfen %s\nuser tsume_answer 1000 5000\nquit\n' "$SMOKE_SFEN" \
+            | ./dist/KomoringHeights-windows-x64-avx2.exe)
+          echo "$out" | tail -n 20
+          echo "$out" | grep -F 'info string tsume_answer {' | grep -F '"status":"mate"' | grep -F '"matePly":1'
+
+      - uses: actions/upload-artifact@v7
         with:
-          path: main
+          name: windows
+          path: dist/*
+          if-no-files-found: error
 
-      - name: ndk-build
-        run: ./main/script/android_build.sh -e ${{ matrix.edition }}
-
-      - uses: actions/upload-artifact@v2
-        with:
-          name: build-android_${{ github.run_number }}_${{ github.sha }}
-          path: ./main/build/**/*
-
-  build-mac:
-    runs-on: macos-12
-    strategy:
-      matrix:
-        edition:
-          - USER_ENGINE
-        compiler: [clang++-14]
-        target: ["normal"]
-        archcpu:
-          [
-            "AVX512,AVX2,SSE42,SSE2",
-            "M1,SSE41,SSSE3,OTHER",
-          ]
-
+  release:
+    name: Publish release
+    needs: [build-linux, build-windows]
+    if: startsWith(github.ref, 'refs/tags/kh-') || inputs.tag != ''
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
     steps:
-      - name: Checkout own repository
-        uses: actions/checkout@v2
-        with:
-          path: main
+      - uses: actions/checkout@v7
 
-      - name: install clang-14
-        run: |
-          brew install llvm@14
-          ln -s /usr/local/opt/llvm@14/bin/clang++ /usr/local/bin/clang++-14
-          export LDFLAGS="-L/usr/local/opt/llvm@14/lib"
-          export CPPFLAGS="-I/usr/local/opt/llvm@14/include"
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
 
-      - name: make
-        run: ./main/script/build.sh -e ${{ matrix.edition }} -c ${{ matrix.compiler }} -t ${{ matrix.target }} -a ${{ matrix.archcpu }} -o mac
+      - name: Name assets after the tag and checksum them
+        run: |
+          mkdir release
+          cp artifacts/KomoringHeights-linux-x86_64-avx2 "release/KomoringHeights-${TAG}-linux-x86_64-avx2"
+          cp artifacts/KomoringHeights-windows-x64-avx2.exe "release/KomoringHeights-${TAG}-windows-x64-avx2.exe"
+          chmod +x "release/KomoringHeights-${TAG}-linux-x86_64-avx2"
+          cp Copying.txt release/Copying.txt
+          (cd release && sha256sum KomoringHeights-* Copying.txt > SHA256SUMS && cat SHA256SUMS)
 
-      - uses: actions/upload-artifact@v2
-        with:
-          name: build-mac_${{ github.run_number }}_${{ github.sha }}
-          path: ./main/build/**/**/*
+      - name: Release notes
+        run: |
+          cat > notes.md <<EOF
+          KomoringHeights (rustify-app fork) built from \`${GITHUB_SHA}\`.
 
-  release-pkg:
-    name: Release package
-    needs:
-      - build-msys2-windows
-      - build-android
-      - build-mac
-    # ubuntu-latest = ubuntu-18.04 => ubuntu-20.04
-    # https://github.com/actions/virtual-environments/issues/1816
-    # https://docs.github.com/ja/free-pro-team@latest/actions/reference/specifications-for-github-hosted-runners
-    runs-on: ubuntu-20.04
-    steps:
-      - name: Set version
-        id: version
-        run: |
-          REPOSITORY=$(echo ${{ github.repository }} | sed -e "s#.*/##")
-          VERSION=$(echo ${{ github.ref }} | sed -e "s#refs/tags/##g")
-          echo ::set-output name=version::$VERSION
-          echo ::set-output name=filename::$REPOSITORY-$VERSION
-      - uses: actions/checkout@v2
-        with:
-          path: main
-      - name: Download artifact to get build-windows
-        uses: actions/download-artifact@v2
-        with:
-          name: build-windows_${{ github.run_number }}_${{ github.sha }}
-          path: release-windows
-      - name: Download artifact to get build-android
-        uses: actions/download-artifact@v2
-        with:
-          name: build-android_${{ github.run_number }}_${{ github.sha }}
-          path: release-android
-      - name: Download artifact to get build-mac
-        uses: actions/download-artifact@v2
-        with:
-          name: build-mac_${{ github.run_number }}_${{ github.sha }}
-          path: release-mac
-      - name: Display structure of downloaded files
-        run: ls -R release-windows release-android release-mac
-      - name: copy docs
-        run: |
-          cp main/Copying.txt release-windows/windows
-          cp -r main/source/ release-windows/windows
-          cp -r main/docs/ release-windows/windows
-          cp -r main/source/engine/user-engine/docs/ release-windows/windows
-          chmod +x release-windows/windows/USER/*.exe
+          This build carries the **完全作解答モード（df-pn ベース）**:
 
-          cp main/Copying.txt release-android/android/KomoringHeights
-          cp -r main/docs/ release-android/android/KomoringHeights
-          cp -r main/source/engine/user-engine/docs/ release-android/android/KomoringHeights
-          chmod +x release-android/android/KomoringHeights/KomoringHeights_*
+          \`\`\`
+          position sfen <sfen>
+          user tsume_answer [部分問題1つあたりms=3000] [全体df-pn ms=30000] [作意USI手順...]
+          \`\`\`
 
-          cp main/Copying.txt release-mac/mac
-          cp -r main/source/ release-mac/mac
-          cp -r main/docs/ release-mac/mac
-          cp -r main/source/engine/user-engine/docs/ release-mac/mac
-          find release-mac/mac/KomoringHeights -type f | \
-            grep -v '.log$' | \
-            xargs chmod +x
-      - name: Display structure of downloaded files
-        run: ls -R release-windows release-android
-      - name: make build-windows zip/7z
-        run: |
-          7z a -tzip build-windows.zip windows
-          7z a -t7z build-windows.7z windows
-        working-directory: release-windows
-      - name: make build-android zip/7z
-        run: |
-          zip -jr build-android.zip android/KomoringHeights
-        working-directory: release-android
-      - name: make build-mac zip/7z
-        run: |
-          7z a -tzip build-mac.zip mac
-          7z a -t7z build-mac.7z mac
-        working-directory: release-mac
-      - name: Archive Size
-        id: archive_size
-        run: |
-          echo ::set-output name=windows_zip::$(stat -c%s "release-windows/build-windows.zip" | awk '{ split( "B KB MB GB TB PB" , v ); s=1; while( $1>1024 ){ $1/=1024; s++ } printf "%.2f %s", $1, v[s] }')
-          echo ::set-output name=windows_7z::$(stat -c%s "release-windows/build-windows.7z" | awk '{ split( "B KB MB GB TB PB" , v ); s=1; while( $1>1024 ){ $1/=1024; s++ } printf "%.2f %s", $1, v[s] }')
-          echo ::set-output name=android_zip::$(stat -c%s "release-android/build-android.zip" | awk '{ split( "B KB MB GB TB PB" , v ); s=1; while( $1>1024 ){ $1/=1024; s++ } printf "%.2f %s", $1, v[s] }')
-          echo ::set-output name=mac_zip::$(stat -c%s "release-mac/build-mac.zip" | awk '{ split( "B KB MB GB TB PB" , v ); s=1; while( $1>1024 ){ $1/=1024; s++ } printf "%.2f %s", $1, v[s] }')
-          echo ::set-output name=mac_7z::$(stat -c%s "release-mac/build-mac.7z" | awk '{ split( "B KB MB GB TB PB" , v ); s=1; while( $1>1024 ){ $1/=1024; s++ } printf "%.2f %s", $1, v[s] }')
-      - name: Create release note
-        id: create-release-note
-        run: |
-          echo 'RELEASE_BODY<<END' >> $GITHUB_OUTPUT
-          cat main/source/engine/user-engine/docs/ReleaseNote.md >> $GITHUB_OUTPUT
-          echo 'END' >> $GITHUB_OUTPUT
-      - name: Create release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: KomoringHeights ${{ steps.version.outputs.version }}
-          body: |
-            ${{ steps.create-release-note.outputs.RELEASE_BODY }}
+          It solves under 詰将棋 rules — futile interpositions (無駄合) are not
+          counted as defences, the defender takes the longest line and avoids
+          leaving the attacker spare pieces — and checks the answer for 余詰.
+          The result is one \`info string tsume_answer {json}\` line. See
+          [docs/idea/tsume-mode.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/idea/tsume-mode.md).
 
-          # ドラフト（下書き）状態にしない(false)
-          draft: false
-          # 先行リリースのフラグを付ける(false)
-          prerelease: false
-      - name: Upload release asset build-windows.zip
-        uses: actions/upload-release-asset@v1.0.1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: release-windows/build-windows.zip
-          asset_name: ${{ steps.version.outputs.filename }}-windows.zip
-          asset_content_type: application/zip
-      - name: Upload release asset build-windows.7z
-        uses: actions/upload-release-asset@v1.0.1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: release-windows/build-windows.7z
-          asset_name: ${{ steps.version.outputs.filename }}-windows.7z
-          asset_content_type: application/octet-stream
-      - name: Upload release asset build-android.zip
-        uses: actions/upload-release-asset@v1.0.1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: release-android/build-android.zip
-          asset_name: ${{ steps.version.outputs.filename }}-android.zip
-          asset_content_type: application/zip
-      - name: Upload release asset build-mac.zip
-        uses: actions/upload-release-asset@v1.0.1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: release-mac/build-mac.zip
-          asset_name: ${{ steps.version.outputs.filename }}-mac.zip
-          asset_content_type: application/zip
-      - name: Upload release asset build-mac.7z
-        uses: actions/upload-release-asset@v1.0.1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: release-mac/build-mac.7z
-          asset_name: ${{ steps.version.outputs.filename }}-mac.7z
-          asset_content_type: application/octet-stream
+          | asset | target |
+          |---|---|
+          | \`KomoringHeights-${TAG}-linux-x86_64-avx2\` | Linux x86-64, AVX2, statically linked |
+          | \`KomoringHeights-${TAG}-windows-x64-avx2.exe\` | Windows x64, AVX2, statically linked |
+
+          Verify with \`sha256sum -c SHA256SUMS\`. Licensed under GPLv3 (Copying.txt).
+          EOF
+
+      - name: Publish
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" release/* \
+              --title "KomoringHeights ${TAG} (tsume_answer)" \
+              --notes-file notes.md \
+              --verify-tag
+          fi
