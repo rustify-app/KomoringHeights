@@ -1892,6 +1892,60 @@ struct Hendou {
   std::vector<AnswerLine> lines; ///< 同手数の各応手からの手順
 };
 
+/// 同手数・駒余りなしで並んだ玉方の応手の優先度（大きいほど優先）。攻方の駒を取る手（大駒ほど優先）、
+/// 次に合駒でない手、最後に安い駒の打ち合。どの合駒でも同じ手順で詰むなら解答は最も安い駒で示す
+/// （生成順のままだと飛車合が選ばれ、不自然な解答になる）。
+int ReplyRank(const Position& p, Move m) {
+  static constexpr int kValue[] = {0, 1, 2, 3, 4, 6, 7, 5, 0};  // -, 歩, 香, 桂, 銀, 角, 飛, 金, 玉
+  int rank = 0;
+  if (!is_drop(m) && p.piece_on(to_sq(m)) != NO_PIECE) {
+    const PieceType pt = raw_type_of(p.piece_on(to_sq(m)));
+    rank += 100 + kValue[pt] * 10 + (type_of(p.piece_on(to_sq(m))) != pt ? 5 : 0);
+  }
+  if (is_drop(m)) rank -= kValue[move_dropped_piece(m)];
+  else rank += 1;
+  return rank;
+}
+
+/// 解答木のノード。攻方の手の子は玉方の応手、玉方の手の子は攻方の詰め手。
+struct TreeNode {
+  Move move{MOVE_NONE};
+  int mate{0};             ///< この手を指した後、詰みまでの手数（詰め上がりの手は 0）
+  bool surplus{false};     ///< この手以降、攻方が持駒を余らせて詰められる
+  bool cut{false};         ///< 予算切れで、この手以降を展開していない
+  bool unknown{false};     ///< 時間内に詰むか判定できなかった手（mate は -1。木が不完全なことを示す）
+  std::vector<Move> also;  ///< 同じ升への別の駒の合で、続きが全く同じもの（安い順）
+  std::vector<TreeNode> next;
+};
+
+/// 解答木の予算（user tsume_answer_tree <max_nodes> [ms]）。max_nodes が 0 なら木を出力しない。
+/// ms が 0 なら tsume_answer の全体 df-pn ms を使う。解答手順（usi/answer）は予算に関係なく必ず展開する。
+std::size_t g_tree_max_nodes = 300;
+std::uint64_t g_tree_ms = 0;
+
+void WriteTree(std::ostream& os, const std::vector<TreeNode>& nodes) {
+  os << '[';
+  for (std::size_t i = 0; i < nodes.size(); ++i) {
+    if (i) os << ',';
+    const TreeNode& n = nodes[i];
+    os << "{\"usi\":\"" << USI::move(n.move) << "\",\"mate\":" << n.mate;
+    if (!n.also.empty()) {
+      os << ",\"also\":[";
+      for (std::size_t j = 0; j < n.also.size(); ++j) os << (j ? "," : "") << '"' << USI::move(n.also[j]) << '"';
+      os << ']';
+    }
+    if (n.surplus) os << ",\"surplus\":true";
+    if (n.cut) os << ",\"cut\":true";
+    if (n.unknown) os << ",\"unknown\":true";
+    if (!n.next.empty()) {
+      os << ",\"next\":";
+      WriteTree(os, n.next);
+    }
+    os << '}';
+  }
+  os << ']';
+}
+
 //   user tsume_answer <部分問題1つあたりms> <全体のdf-pn ms> [作意USI手順...]
 void AnswerTsume(Position& pos, std::istringstream& is) {
   std::uint64_t node_ms = 3000, raw_ms = 30000;
@@ -2045,17 +2099,8 @@ void AnswerTsume(Position& pos, std::istringstream& is) {
         longest.push_back(m);
       }
     }
-    // 同手数・駒余りなしで並んだときは、攻方の駒を取る手（大駒ほど優先）、次に合駒でない手を選ぶ
-    auto reply_rank = [&](Move m) {
-      int rank = 0;
-      if (!is_drop(m) && p.piece_on(to_sq(m)) != NO_PIECE) {
-        static constexpr int kValue[] = {0, 1, 2, 3, 4, 6, 7, 5, 0};  // -, 歩, 香, 桂, 銀, 角, 飛, 金, 玉
-        const PieceType pt = raw_type_of(p.piece_on(to_sq(m)));
-        rank += 100 + kValue[pt] * 10 + (type_of(p.piece_on(to_sq(m))) != pt ? 5 : 0);
-      }
-      if (!is_drop(m)) rank += 1;
-      return rank;
-    };
+    // 同手数・駒余りなしで並んだときの優先順（ReplyRank）
+    auto reply_rank = [&](Move m) { return ReplyRank(p, m); };
     std::stable_sort(longest.begin(), longest.end(), [&](Move a, Move b) { return reply_rank(a) > reply_rank(b); });
     std::vector<AnswerLine> lines;
     for (const Move m : longest) {
@@ -2111,6 +2156,152 @@ void AnswerTsume(Position& pos, std::istringstream& is) {
     json << "]}";
   }
   json << "]";
+
+  // 解答木: 解答手順を1本の直線でなく木で示す。
+  //   攻方手番: 残り手数以内に詰む王手を全て（無駄合は応手に数えない）
+  //   玉方手番: 無駄合を除く最長の応手。駒余りにならない応手があればそれだけ。
+  //             同じ升への合で続きが全く同じものは、最も安い駒の1つにまとめて also に並べる
+  // 各手番で解答手順の手を先頭に置き、解答手順は予算に関係なく展開する。
+  if (answer.ok && g_tree_max_nodes > 0) {
+    std::size_t tree_nodes = 0, tree_unresolved = 0;
+    bool tree_truncated = false;
+    const auto tree_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(g_tree_ms ? g_tree_ms : raw_ms);
+    auto out_of_budget = [&]() {
+      if (tree_nodes >= g_tree_max_nodes || std::chrono::steady_clock::now() >= tree_deadline) {
+        tree_truncated = true;
+        return true;
+      }
+      return false;
+    };
+    using MainIt = std::vector<Move>::const_iterator;
+    const MainIt main_end = answer.moves.cend();
+    std::function<std::vector<TreeNode>(Position&, int, MainIt)> build_tree =
+        [&](Position& p, int remaining, MainIt main_it) -> std::vector<TreeNode> {
+      const Move main_move = main_it != main_end ? *main_it : MOVE_NONE;
+      const bool or_node = remaining % 2 == 1;
+      // 候補を集める（解答手順の手を先頭に）
+      // 手と、その後の詰みまでの手数（kUnknownLen: 時間内に判定できなかった）
+      constexpr int kUnknownLen = -2;
+      std::vector<std::pair<Move, int>> cand;
+      const auto settled = [](komori::NodeState st) {
+        return st == komori::NodeState::kProven || st == komori::NodeState::kDisproven ||
+               st == komori::NodeState::kRepetition;
+      };
+      for (const auto& ext : MoveList<LEGAL_ALL>(p)) {
+        const Move m = ext.move;
+        if (or_node && !p.gives_check(m)) continue;
+        if (!or_node && is_futile_drop(p, m)) continue;
+        StateInfo st;
+        p.do_move(m, st);
+        int len = -1;
+        if (or_node && remaining == 1) {
+          const auto st1 = dfpn(p.sfen(), node_ms, 1).state;
+          if (st1 == komori::NodeState::kProven) len = 0;
+          else if (!settled(st1)) len = kUnknownLen;
+        } else if (or_node) {
+          // 残り手数以内に詰むか。まず合駒割引の軽い探索で否定を試みる
+          const std::string s = p.sfen();
+          const auto lower = RunDfpn(s, node_ms, remaining - 1, true);
+          ++dfpn_calls;
+          if (lower.state != komori::NodeState::kDisproven && lower.state != komori::NodeState::kRepetition) {
+            const auto d = dfpn(s, node_ms, remaining - 1);
+            if (d.state == komori::NodeState::kProven && !d.moves.empty()) len = static_cast<int>(d.moves.size());
+            else if (!settled(d.state)) len = kUnknownLen;
+          }
+        } else {
+          // 玉方: 残り手数ちょうどで詰む応手が最長。詰まない・判定できない応手は木が不完全なので unknown で残す
+          const auto d = dfpn(p.sfen(), node_ms, remaining - 1);
+          if (d.state == komori::NodeState::kProven) {
+            if (static_cast<int>(d.moves.size()) == remaining - 1) len = remaining - 1;
+          } else {
+            len = kUnknownLen;
+          }
+        }
+        p.undo_move(m);
+        if (len >= 0 || len == kUnknownLen) cand.emplace_back(m, len);
+      }
+      std::stable_sort(cand.begin(), cand.end(), [&](const auto& a, const auto& b) {
+        if ((a.first == main_move) != (b.first == main_move)) return a.first == main_move;
+        if ((a.second == kUnknownLen) != (b.second == kUnknownLen)) return b.second == kUnknownLen;
+        if (or_node) return a.second < b.second;  // 短い詰みを先に
+        return ReplyRank(p, a.first) > ReplyRank(p, b.first);
+      });
+
+      std::vector<TreeNode> out;
+      for (const auto& [m, len] : cand) {
+        const bool on_main = m == main_move;
+        if (!on_main && out_of_budget()) break;
+        TreeNode n;
+        n.move = m;
+        n.mate = len;
+        ++tree_nodes;
+        if (len == kUnknownLen) {
+          n.mate = -1;
+          n.unknown = true;
+          ++tree_unresolved;
+          out.push_back(std::move(n));
+          continue;
+        }
+        StateInfo st;
+        p.do_move(m, st);
+        if (len == 0) {
+          n.surplus = p.hand_of(BLACK) != HAND_ZERO;
+        } else if (!on_main && out_of_budget()) {
+          n.cut = true;
+        } else {
+          n.next = build_tree(p, len, on_main ? main_it + 1 : main_end);
+          if (n.next.empty()) n.cut = true;
+          // 攻方の手: 玉方が駒余りを避けられないときだけ駒余り。玉方の手: 攻方が余らせて詰められれば駒余り
+          // 判定できなかった手は駒余りの判定に使わない
+          const auto is_surplus = [](const TreeNode& c) { return c.surplus || c.unknown; };
+          const auto known_surplus = [](const TreeNode& c) { return c.surplus && !c.unknown; };
+          const bool any_known =
+              std::any_of(n.next.begin(), n.next.end(), [](const TreeNode& c) { return !c.unknown; });
+          n.surplus = any_known && (or_node ? std::all_of(n.next.begin(), n.next.end(), is_surplus)
+                                            : std::any_of(n.next.begin(), n.next.end(), known_surplus));
+        }
+        p.undo_move(m);
+        out.push_back(std::move(n));
+      }
+      if (!or_node && !out.empty()) {
+        // 駒余りにならない応手があれば、駒余りになる応手は玉方は選ばない
+        if (std::any_of(out.begin(), out.end(), [](const TreeNode& c) { return !c.surplus && !c.unknown; })) {
+          out.erase(std::remove_if(out.begin(), out.end(),
+                                   [&](const TreeNode& c) { return c.surplus && c.move != main_move; }),
+                    out.end());
+        }
+        // 同じ升への合で続きが同じものをまとめる（並びは ReplyRank 順なので先頭が最も安い駒）
+        std::vector<TreeNode> merged;
+        std::vector<std::string> keys;
+        for (auto& c : out) {
+          std::string key;
+          if (is_drop(c.move) && !c.unknown) {
+            std::ostringstream os;
+            WriteTree(os, c.next);
+            key = std::to_string(static_cast<int>(to_sq(c.move))) + (c.surplus ? "s" : "") + (c.cut ? "c" : "") +
+                  os.str();
+          }
+          const auto hit = key.empty() ? keys.end() : std::find(keys.begin(), keys.end(), key);
+          if (hit != keys.end()) {
+            merged[hit - keys.begin()].also.push_back(c.move);
+          } else {
+            keys.push_back(key);
+            merged.push_back(std::move(c));
+          }
+        }
+        out = std::move(merged);
+      }
+      return out;
+    };
+    const int tree_ply = static_cast<int>(answer.moves.size());
+    const auto tree = build_tree(root, tree_ply, answer.moves.cbegin());
+    json << ",\"tree\":{\"plies\":" << tree_ply << ",\"nodes\":" << tree_nodes
+         << ",\"truncated\":" << (tree_truncated ? "true" : "false") << ",\"unresolved\":" << tree_unresolved
+         << ",\"moves\":";
+    WriteTree(json, tree);
+    json << "}";
+  }
 
   // 作意の検査
   std::vector<Move> intended;
@@ -2342,6 +2533,13 @@ void user_test(Position& pos, std::istringstream& is) {
     g_answer_check_alternatives = v != "off";
     return;
   }
+  if (token == "tsume_answer_tree") {
+    //   user tsume_answer_tree <max_nodes> [ms]   (max_nodes 0: 木を出力しない)
+    std::string v;
+    if (is >> v) g_tree_max_nodes = static_cast<std::size_t>(std::stoull(v));
+    if (is >> v) g_tree_ms = std::stoull(v);
+    return;
+  }
   if (token == "tsume_answer") {
     AnswerTsume(pos, is);
     return;
@@ -2527,6 +2725,7 @@ void user_test(Position& pos, std::istringstream& is) {
     sync_cout << "info string [user] 不明なサブコマンド: " << token << sync_endl;
     sync_cout << "info string [user] 使い方:" << sync_endl;
     sync_cout << "info string [user]   user tsume_answer [部分問題ms] [全体df-pn ms] [作意USI手順...]" << sync_endl;
+    sync_cout << "info string [user]   user tsume_answer_tree <最大ノード数> [ms]  (解答木の予算。0 で木なし)" << sync_endl;
     sync_cout << "info string [user]   user tsume_verify [上限手数] [上限ノード数] [既知USI手順...]" << sync_endl;
     sync_cout << "info string [user]   user tsume_save <上限手数> <上限ノード数> <JSONLファイル> [既知USI手順...]" << sync_endl;
     sync_cout << "info string [user]   user tsume_load <JSONLファイル> [上限手数] [上限ノード数]" << sync_endl;
