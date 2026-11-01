@@ -39,6 +39,12 @@ env:
   # A 1-move tsume: G*5b is the only mate. Used to prove the built binary
   # answers `user tsume_answer` before anything is published.
   SMOKE_SFEN: "4k4/9/4P4/9/9/9/9/9/9 b G2r2b3g4s4n4l17p 1"
+  # An 11-move tsume whose last defence is an interposition at 2d where every piece
+  # is mated the same way (N*3g). The answer must show the cheapest legal piece
+  # (L*2d; a pawn would be 二歩), not the rook the move generator lists first, and
+  # the answer tree must branch at 5c (promote or not) and merge the other pieces
+  # of that interposition into "also".
+  INTERPOSE_SFEN: "9/9/9/5+p3/6p2/7p1/3G1k3/4R3L/3B2+p1+B b Nr3g4s3n3l14p 1"
 
 jobs:
   build-linux:
@@ -75,6 +81,17 @@ jobs:
             | timeout 120 ./dist/KomoringHeights-linux-x86_64-avx2)
           echo "$out" | tail -n 20
           echo "$out" | grep -F 'info string tsume_answer {' | grep -F '"status":"mate"' | grep -F '"matePly":1'
+
+      - name: Regression (answer tree, cheapest equal interposition)
+        run: |
+          out=$(printf 'usi\nsetoption name USI_Hash value 256\nsetoption name Threads value 1\nisready\nuser tsume_answer_tree 300 120000\nposition sfen %s\nuser tsume_answer 1000 5000\nquit\n' "$INTERPOSE_SFEN" \
+            | timeout 300 ./dist/KomoringHeights-linux-x86_64-avx2)
+          line=$(echo "$out" | grep -F 'info string tsume_answer {' | tail -n 1)
+          echo "$line"
+          echo "$line" | grep -F '"answer":"6g5g 4g3f 5g4f 3f2e 5h5c+ 2e3d 6i2e 3d2e 5c2c L*2d N*3g"'
+          echo "$line" | grep -F '"truncated":false,"unresolved":0'
+          echo "$line" | grep -F '{"usi":"5h5c","mate":6'
+          echo "$line" | grep -F '{"usi":"L*2d","mate":1,"also":["N*2d","S*2d","G*2d","B*2d","R*2d"]'
 
       - uses: actions/upload-artifact@v7
         with:
